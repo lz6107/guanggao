@@ -938,8 +938,12 @@ async def quick_ad_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             VALUES (%s, %s, 'paused', %s, %s, TRUE, %s, %s, NULL, NULL, NULL)
             ON CONFLICT(target) DO UPDATE SET
+                status='paused',
                 interval_minutes=EXCLUDED.interval_minutes,
-                daily_limit=EXCLUDED.daily_limit;
+                daily_limit=EXCLUDED.daily_limit,
+                start_at=NULL,
+                end_at=NULL,
+                total_limit=NULL;
             """,
             (
                 target,
@@ -966,9 +970,23 @@ async def quick_ad_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = None
+
+    if "shezhi" in context.user_data:
+        target = context.user_data["shezhi"].get("target")
+
     context.user_data.pop("quick_ad", None)
     context.user_data.pop("shezhi", None)
-    await update.message.reply_text("已取消当前流程。")
+
+    if target:
+        await update.message.reply_text(
+            f"已取消当前设置流程。\n\n"
+            f"目标 {target} 已保持暂停状态，避免按旧规则继续投放。\n"
+            f"需要恢复请重新使用：/shezhi {target}"
+        )
+    else:
+        await update.message.reply_text("已取消当前流程。")
+
     return ConversationHandler.END
 
 
@@ -998,12 +1016,20 @@ async def shezhi_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    # 关键修复：
+    # 进入 /shezhi 设置流程时，先暂停该目标，防止后台循环按旧规则继续投放。
+    execute(
+        "UPDATE targets SET status='paused' WHERE target=%s;",
+        (target,)
+    )
+
     context.user_data["shezhi"] = {
         "target": target,
     }
 
     await update.message.reply_text(
         f"开始设置投放目标：{target}\n\n"
+        f"设置期间该目标已临时暂停，确认保存后才会恢复投放。\n\n"
         f"第 1 步：是否立即投放一次？\n"
         f"回复：是 / 否"
     )
@@ -1437,9 +1463,6 @@ async def delete_message_safe(bot, actual_chat_id: str, message_id: int) -> bool
 
 
 async def delete_sponsor_ads(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    只删除某广告主已经发出去的广告消息，不删除广告主资料和广告素材。
-    """
     if not await admin_only(update):
         return
 
@@ -1487,14 +1510,6 @@ async def delete_sponsor_ads(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def delete_sponsor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    完全删除某个广告主：
-    1. 先尝试删除该广告主已经投放出去的 Telegram 广告消息
-    2. 删除 ad_messages 投放记录
-    3. 删除 delivery_logs 日志
-    4. 删除 ads 广告素材
-    5. 删除 sponsors 广告主本身
-    """
     if not await admin_only(update):
         return
 
@@ -1866,8 +1881,6 @@ async def send_ad_to_target(bot, target_row, force=False):
     if not ad:
         reason = "没有可投放广告"
 
-        # 广告主暂停、广告素材暂停、或者广告被删光了，都会走到这里。
-        # 这不应该算失败，只算跳过；同一个目标同一个原因 10 分钟内只记一次日志，避免刷屏。
         if should_log_skip(target, reason):
             log_delivery(
                 target,
@@ -2142,7 +2155,7 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("logs", logs))
 
-    print("广告投放机器人启动成功：已修复暂停广告主刷屏，并新增 /delete_sponsor 完全删除广告主")
+    print("广告投放机器人启动成功：/shezhi 设置期间自动暂停目标，避免按旧规则乱发")
     app.run_polling()
 
 
