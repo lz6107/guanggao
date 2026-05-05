@@ -190,7 +190,6 @@ def init_db():
     cur.execute("ALTER TABLE ad_messages ADD COLUMN IF NOT EXISTS target TEXT;")
     cur.execute("ALTER TABLE ad_messages ADD COLUMN IF NOT EXISTS actual_chat_id TEXT;")
 
-    # 如果旧数据库里还有 chat_id 字段，并且它是 NOT NULL，取消 NOT NULL 限制
     cur.execute("""
     DO $$
     BEGIN
@@ -205,7 +204,6 @@ def init_db():
     END $$;
     """)
 
-    # 尽量把旧 chat_id 数据迁移到新字段，方便删除旧广告
     cur.execute("""
     DO $$
     BEGIN
@@ -512,10 +510,6 @@ def set_meta(key: str, value: str):
 
 
 def should_log_skip(target: str, reason: str, cooldown_seconds: int = 600) -> bool:
-    """
-    跳过日志不要每分钟刷爆数据库。
-    同一个目标、同一个原因，10分钟内只记一次。
-    """
     key = f"skip_log:{target}:{reason}"
     last_raw = get_meta(key, "0")
 
@@ -534,11 +528,6 @@ def should_log_skip(target: str, reason: str, cooldown_seconds: int = 600) -> bo
 
 
 def record_ad_message(sponsor_id, ad_id, target, actual_chat_id, message_id):
-    """
-    兼容新旧数据库：
-    1. 新表写 target / actual_chat_id
-    2. 如果旧表还残留 chat_id 字段，也一起写入，避免 NOT NULL 报错
-    """
     conn = db_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -633,6 +622,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /list_ads - 查看广告素材列表
 /list_targets - 查看投放目标列表
 /delete_sponsor_ads 广告主名称 - 删除某个广告主所有已投放广告
+/delete_sponsor 广告主名称 - 彻底删除某个广告主、广告素材、投放记录和日志
 /delete_ads_here - 删除当前群里机器人发过的广告
 /delete_all_ads - 删除所有未删除的广告
 /pause_sponsor 广告主名称 - 暂停某个广告主
@@ -1447,6 +1437,9 @@ async def delete_message_safe(bot, actual_chat_id: str, message_id: int) -> bool
 
 
 async def delete_sponsor_ads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    只删除某广告主已经发出去的广告消息，不删除广告主资料和广告素材。
+    """
     if not await admin_only(update):
         return
 
@@ -1489,7 +1482,99 @@ async def delete_sponsor_ads(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await asyncio.sleep(0.15)
 
     await update.message.reply_text(
-        f"广告主【{sponsor_name}】清理完成。\n成功：{ok_count}\n失败：{fail_count}"
+        f"广告主【{sponsor_name}】广告消息清理完成。\n成功：{ok_count}\n失败：{fail_count}"
+    )
+
+
+async def delete_sponsor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    完全删除某个广告主：
+    1. 先尝试删除该广告主已经投放出去的 Telegram 广告消息
+    2. 删除 ad_messages 投放记录
+    3. 删除 delivery_logs 日志
+    4. 删除 ads 广告素材
+    5. 删除 sponsors 广告主本身
+    """
+    if not await admin_only(update):
+        return
+
+    sponsor_name = " ".join(context.args).strip()
+
+    if not sponsor_name:
+        await update.message.reply_text(
+            "用法：/delete_sponsor 广告主名称\n\n"
+            "说明：这个命令会彻底删除该广告主、该广告主的所有广告素材、投放记录和日志，并尝试删除已经发出去的广告消息。"
+        )
+        return
+
+    sponsor = fetch_one(
+        "SELECT id, name FROM sponsors WHERE name=%s;",
+        (sponsor_name,)
+    )
+
+    if not sponsor:
+        await update.message.reply_text(f"没有找到广告主：{sponsor_name}")
+        return
+
+    sponsor_id = sponsor["id"]
+
+    rows = fetch_all("""
+        SELECT id, actual_chat_id, message_id
+        FROM ad_messages
+        WHERE sponsor_id=%s
+          AND deleted=FALSE
+          AND actual_chat_id IS NOT NULL
+          AND message_id IS NOT NULL
+        ORDER BY id DESC;
+    """, (sponsor_id,))
+
+    ok_count = 0
+    fail_count = 0
+
+    for r in rows:
+        ok = await delete_message_safe(
+            context.bot,
+            r["actual_chat_id"],
+            r["message_id"]
+        )
+
+        if ok:
+            ok_count += 1
+            execute(
+                "UPDATE ad_messages SET deleted=TRUE, deleted_at=NOW() WHERE id=%s;",
+                (r["id"],)
+            )
+        else:
+            fail_count += 1
+
+        await asyncio.sleep(0.15)
+
+    execute(
+        "DELETE FROM delivery_logs WHERE sponsor_id=%s;",
+        (sponsor_id,)
+    )
+
+    execute(
+        "DELETE FROM ad_messages WHERE sponsor_id=%s;",
+        (sponsor_id,)
+    )
+
+    execute(
+        "DELETE FROM ads WHERE sponsor_id=%s;",
+        (sponsor_id,)
+    )
+
+    execute(
+        "DELETE FROM sponsors WHERE id=%s;",
+        (sponsor_id,)
+    )
+
+    await update.message.reply_text(
+        f"广告主【{sponsor_name}】已彻底删除。\n\n"
+        f"已尝试删除线上广告：{len(rows)} 条\n"
+        f"删除成功：{ok_count}\n"
+        f"删除失败：{fail_count}\n\n"
+        f"该广告主、广告素材、投放记录、投放日志已从数据库删除。"
     )
 
 
@@ -1745,7 +1830,6 @@ def pick_next_ad_for_target(target: str):
 async def send_ad_to_target(bot, target_row, force=False):
     target = target_row["target"]
 
-    # 非强制发送时，严格检查投放条件
     if not force:
         ok, reason = target_time_window_ok(target_row)
         if not ok:
@@ -1777,16 +1861,23 @@ async def send_ad_to_target(bot, target_row, force=False):
                 log_delivery(target, None, None, "skipped", reason, None)
             return False, reason
 
-    # 选择广告
     ad = pick_next_ad_for_target(target)
 
     if not ad:
         reason = "没有可投放广告"
-        log_delivery(target, None, None, "failed", reason, "请检查广告主和广告素材是否启用")
-        await notify_admins(
-            bot,
-            f"❌ 广告投放失败\n\n目标：{target}\n原因：没有可投放广告\n\n请检查广告主和广告素材是否启用。"
-        )
+
+        # 广告主暂停、广告素材暂停、或者广告被删光了，都会走到这里。
+        # 这不应该算失败，只算跳过；同一个目标同一个原因 10 分钟内只记一次日志，避免刷屏。
+        if should_log_skip(target, reason):
+            log_delivery(
+                target,
+                None,
+                None,
+                "skipped",
+                reason,
+                "当前没有启用中的广告主或广告素材"
+            )
+
         return False, reason
 
     text = build_ad_text(ad["sponsor_name"], ad["text"])
@@ -1794,7 +1885,6 @@ async def send_ad_to_target(bot, target_row, force=False):
 
     msg = None
 
-    # 第一步：先真正发送 Telegram 消息
     try:
         image_type = ad.get("image_type")
         image_value = ad.get("image_value")
@@ -1861,7 +1951,6 @@ async def send_ad_to_target(bot, target_row, force=False):
 
         return False, err
 
-    # 第二步：发送成功后，再写数据库记录
     actual_chat_id = str(msg.chat.id)
     message_id = msg.message_id
 
@@ -1904,7 +1993,6 @@ message_id：{message_id}
 
         return False, "发送成功但记录失败"
 
-    # 第三步：记录成功日志和管理员通知
     log_delivery(
         target,
         ad["ad_id"],
@@ -2047,13 +2135,14 @@ def main():
     app.add_handler(CommandHandler("resume_here", resume_here))
 
     app.add_handler(CommandHandler("delete_sponsor_ads", delete_sponsor_ads))
+    app.add_handler(CommandHandler("delete_sponsor", delete_sponsor))
     app.add_handler(CommandHandler("delete_ads_here", delete_ads_here))
     app.add_handler(CommandHandler("delete_all_ads", delete_all_ads))
 
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("logs", logs))
 
-    print("广告投放机器人启动成功：已修复旧 chat_id 字段、发送记录、删除和频率问题")
+    print("广告投放机器人启动成功：已修复暂停广告主刷屏，并新增 /delete_sponsor 完全删除广告主")
     app.run_polling()
 
 
